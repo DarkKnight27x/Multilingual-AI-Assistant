@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+
+# Model files
+*.safetensors
+*.pt
+*.pth
+*.bin
+
+# Generated audio
+*.wav
+*.mp3
+*.flac
+
+# Hugging Face cache
+.cache/
+huggingface/
