@@ -9,12 +9,14 @@ import json
 import base64
 import sys
 import os
+import numpy as np
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "..", "shared"))
 from interfaces import transcribe, synthesize
 
 SAMPLE_RATE = 8000       # confirm against your Voicebot applet's config
-SILENCE_TIMEOUT = 1.5    # seconds of no incoming audio before we treat it as "caller stopped talking"
+SILENCE_TIMEOUT = 1.5    # seconds of actual quiet before we treat it as "caller stopped talking"
+SILENCE_RMS_THRESHOLD = 300  # tune this — lower catches quieter speech, higher ignores background noise
 CHUNK_SIZE = 3200        # ~100ms at 8kHz/16-bit mono — halve/double if your sample rate differs
 
 sessions = {}
@@ -36,9 +38,22 @@ def new_session(stream_sid):
         "last_audio_time": asyncio.get_event_loop().time(),
         "stream_sid": stream_sid,
         "language": None,
+        "language_attempts": 0,        # how many low-confidence tries before we escalate to DTMF
+        "awaiting_dtmf": False,        # True once we've asked the caller to press a key
         "stage": "greeting",
         "history": [],
     }
+
+
+# Map keypad digits to language codes — extend as you support more languages
+DTMF_LANGUAGE_MAP = {
+    "1": "ta",   # Tamil
+    "2": "hi",   # Hindi
+    "3": "en",   # English
+}
+
+LOW_CONFIDENCE_THRESHOLD = 0.6
+MAX_LANGUAGE_ATTEMPTS = 2  # after this many low-confidence tries, fall back to DTMF
 
 
 async def monitor_silence(websocket, call_sid):
@@ -57,42 +72,102 @@ async def monitor_silence(websocket, call_sid):
 
 async def process_turn(websocket, call_sid, audio_bytes):
     session = sessions[call_sid]
-    result = transcribe(audio_bytes)
+
+    # If we're waiting on a keypad language selection, don't try to transcribe —
+    # DTMF is handled separately in the handler's dtmf branch.
+    if session["awaiting_dtmf"]:
+        return
+
+    result = await asyncio.to_thread(transcribe, audio_bytes)
     caller_text = result["text"]
 
-    # Lock in language on first confident detection; don't flip-flop on later low-confidence guesses
-    if session["language"] is None and result["confidence"] >= 0.6:
-        session["language"] = result["language"]
-        print(f"[{call_sid}] Language locked to: {session['language']}")
-    elif session["language"] is None:
-        print(f"[{call_sid}] Low confidence ({result['confidence']}), language not yet locked")
+    if session["language"] is None:
+        if result["confidence"] >= LOW_CONFIDENCE_THRESHOLD:
+            session["language"] = result["language"]
+            print(f"[{call_sid}] Language locked to: {session['language']} (confidence {result['confidence']})")
+        else:
+            session["language_attempts"] += 1
+            print(f"[{call_sid}] Low confidence ({result['confidence']}), "
+                  f"attempt {session['language_attempts']}/{MAX_LANGUAGE_ATTEMPTS}")
 
-    language = session["language"] or result["language"] or "en"
+            if session["language_attempts"] < MAX_LANGUAGE_ATTEMPTS:
+                # Try again — play a short multilingual prompt asking them to repeat themselves
+                prompt_audio = await asyncio.to_thread(
+                    synthesize,
+                    "Please say that again. Tamil, Hindi, or English is fine.",
+                    "en"  # neutral fallback language for the prompt itself
+                )
+                await send_pcm(websocket, session["stream_sid"], prompt_audio)
+                print(f"[{call_sid}] Played multilingual retry prompt, waiting for next attempt")
+                return  # don't generate a response yet — we're still figuring out the language
+            else:
+                # Give up on speech detection, fall back to keypad
+                session["awaiting_dtmf"] = True
+                prompt_audio = await asyncio.to_thread(
+                    synthesize,
+                    "Press 1 for Tamil. Press 2 for Hindi. Press 3 for English.",
+                    "en"
+                )
+                await send_pcm(websocket, session["stream_sid"], prompt_audio)
+                print(f"[{call_sid}] Escalated to DTMF fallback, waiting for keypress")
+                return
 
+    language = session["language"]
     print(f"[{call_sid}] Caller said: '{caller_text}' (lang={language}, confidence={result['confidence']})")
 
     # Placeholder response logic — Team B's real /converse call replaces this block later.
     # Kept as its own function so swapping it in later is a one-line change.
-    response_text = build_response(session, caller_text)
+    response_text = await build_response(session, caller_text, call_sid)
 
     session["history"].append({"caller": caller_text, "ai": response_text})
     session["stage"] = "in_conversation"
 
-    response_audio = synthesize(response_text, language)
+    response_audio = await asyncio.to_thread(synthesize, response_text, language)
     await send_pcm(websocket, session["stream_sid"], response_audio)
 
     print(f"[{call_sid}] Turn {len(session['history'])} complete. "
           f"History so far: {[t['caller'] for t in session['history']]}")
 
 
-def build_response(session, caller_text):
+async def build_response(session, caller_text, call_sid):
     """
-    STUB — replace this with a real call to Team B's /converse endpoint:
-        call_converse(text=caller_text, language=session['language'], session_id=<call_sid>)
-    Keep the function signature-independent from the rest of the server so that
-    swap is contained to just this function.
+    Calls Team B's /converse endpoint. Currently pointed at a local stub —
+    once Team B gives you a real URL, just change TEAM_B_CONVERSE_URL below.
+    Nothing else in this file needs to change.
     """
-    return f"You said: {caller_text}"
+    return await asyncio.to_thread(call_converse, text=caller_text, language=session["language"], session_id=call_sid)
+
+
+TEAM_B_CONVERSE_URL = None  # e.g. "https://team-b-api.example.com/converse" — fill in once they have one
+
+
+def call_converse(text, language, session_id):
+    """
+    STUB — mimics what Team B's real /converse endpoint will return, so the
+    rest of the server can be built and tested without waiting on them.
+
+    Real contract (agree exact shape with Team B before swapping this in):
+        POST {TEAM_B_CONVERSE_URL}
+        in:  {"text": text, "language": language, "session_id": session_id}
+        out: {"response": str, "language": str}
+    """
+    if TEAM_B_CONVERSE_URL:
+        try:
+            import requests
+            resp = requests.post(
+                TEAM_B_CONVERSE_URL,
+                json={"text": text, "language": language, "session_id": session_id},
+                timeout=8,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return data["response"]
+        except Exception as e:
+            print(f"[{session_id}] Team B call failed ({e}), falling back to canned response")
+            return "Sorry, I'm having trouble reaching our information system right now."
+
+    # No URL set yet — local stub response
+    return f"You said: {text}"
 
 
 async def send_pcm(websocket, stream_sid, pcm_bytes):
@@ -130,14 +205,38 @@ async def handler(websocket):
                 payload = base64.b64decode(data["media"]["payload"])
                 sessions[call_sid]["buffer"].append(payload)
                 sessions[call_sid]["full_recording"].append(payload)
-                sessions[call_sid]["last_audio_time"] = asyncio.get_event_loop().time()
+
+                # Exotel streams audio continuously, even during silence — so we can't
+                # tell "caller stopped talking" from events stopping. Instead, check the
+                # actual loudness of each chunk and only reset the timer on real speech.
+                samples = np.frombuffer(payload, dtype=np.int16)
+                rms = np.sqrt(np.mean(samples.astype(np.float64) ** 2)) if len(samples) else 0
+                if rms > SILENCE_RMS_THRESHOLD:
+                    sessions[call_sid]["last_audio_time"] = asyncio.get_event_loop().time()
+
                 if len(sessions[call_sid]["buffer"]) % 50 == 0:  # don't spam — print every 50 chunks
-                    print(f"[{call_sid}] ...receiving audio ({len(sessions[call_sid]['buffer'])} chunks so far)")
+                    print(f"[{call_sid}] ...receiving audio ({len(sessions[call_sid]['buffer'])} chunks so far, last RMS={rms:.0f})")
 
         elif event == "dtmf":
             digit = data["dtmf"]["digit"]
             print(f"[{call_sid}] DTMF pressed: {digit}")
-            # language-selection fallback logic goes here next
+            session = sessions.get(call_sid)
+            if session and session["awaiting_dtmf"]:
+                chosen_language = DTMF_LANGUAGE_MAP.get(digit)
+                if chosen_language:
+                    session["language"] = chosen_language
+                    session["awaiting_dtmf"] = False
+                    print(f"[{call_sid}] Language set via DTMF: {chosen_language}")
+                    confirm_audio = await asyncio.to_thread(synthesize, "Language set. Please go ahead.", chosen_language)
+                    await send_pcm(websocket, session["stream_sid"], confirm_audio)
+                else:
+                    print(f"[{call_sid}] Unrecognized digit '{digit}' — not in DTMF_LANGUAGE_MAP")
+                    retry_audio = await asyncio.to_thread(
+                        synthesize,
+                        "Sorry, that wasn't a valid option. Press 1 for Tamil, 2 for Hindi, 3 for English.",
+                        "en"
+                    )
+                    await send_pcm(websocket, session["stream_sid"], retry_audio)
 
         elif event == "stop":
             session = sessions.get(call_sid)
