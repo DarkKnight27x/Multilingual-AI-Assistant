@@ -1,0 +1,20 @@
+version: "3.8"
+
+services:
+  ai-backend:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      - chroma_data:/app/chroma_db
+      - ./data:/app/data   # so KB edits don't require an image rebuild
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  chroma_data:
