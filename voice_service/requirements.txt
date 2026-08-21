@@ -4,7 +4,6 @@ python-multipart
 soundfile
 huggingface_hub
 safetensors
-torch
-torchaudio
 f5-tts
 vocos
+torchcodec
