@@ -47,6 +47,13 @@ def get_or_create_session(session_id: str, language: str) -> SessionState:
     session.language = language  # language can change turn to turn per Team A
     return session
 
+def get_chat_history(session_id: str) -> list[ChatMessage]:
+    session = _SESSIONS.get(session_id)
+
+    if session is None:
+        return []
+
+    return session.history.copy()
 
 _JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
 
