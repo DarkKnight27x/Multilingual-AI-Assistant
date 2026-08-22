@@ -37,6 +37,12 @@ def _cheap_llm_call(prompt: str) -> str:
     return resp.content
 
 
+def _add_assistant_message(session, response: str) -> None:
+    session.history.append(
+        ChatMessage(role="assistant", content=response)
+    )
+
+
 def process_query(
     text: str,
     language: str,
@@ -55,6 +61,7 @@ def process_query(
     session.history.append(
         ChatMessage(role="user", content=text)
     )
+
     try:
         extracted = extract_intent_and_location(text, _cheap_llm_call)
     except Exception as e:
@@ -77,8 +84,12 @@ def process_query(
     # Strict ask-for-state
     # --------------------------------------------------
     if not effective_state and needs_state(effective_category):
+        response = ask_for_missing(language)
+
+        _add_assistant_message(session, response)
+
         return {
-            "response": ask_for_missing(language),
+            "response": response,
             "language": language,
             "session_id": session_id,
             "structured": {
@@ -95,6 +106,7 @@ def process_query(
                 "official_portals": official_portals,
             },
         }
+
     try:
         chunks = retrieve(
             query=text,
@@ -109,6 +121,9 @@ def process_query(
 
     if not context:
         fallback = get_fallback(language)
+
+        _add_assistant_message(session, fallback)
+
         return {
             "response": fallback,
             "language": language,
@@ -138,8 +153,13 @@ def process_query(
         )
     except Exception as e:
         logger.error("LLM generation failed: %s", e)
+
+        fallback = get_fallback(language)
+
+        _add_assistant_message(session, fallback)
+
         return {
-            "response": get_fallback(language),
+            "response": fallback,
             "language": language,
             "session_id": session_id,
             "structured": {
@@ -159,6 +179,8 @@ def process_query(
 
     if not natural_language:
         natural_language = get_fallback(language)
+
+    _add_assistant_message(session, natural_language)
 
     # Merge router portals into structured output
     structured_dict = structured.to_dict()
