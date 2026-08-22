@@ -12,6 +12,7 @@ import logging
 from typing import Optional
 
 from src.conversation import (
+    ChatMessage,
     get_or_create_session,
     extract_intent_and_location,
     update_session_from_request,
@@ -51,6 +52,9 @@ def process_query(
 
     session = get_or_create_session(session_id, language)
 
+    session.history.append(
+        ChatMessage(role="user", content=text)
+    )
     try:
         extracted = extract_intent_and_location(text, _cheap_llm_call)
     except Exception as e:

@@ -19,6 +19,10 @@ from src.prompts import build_intent_prompt
 
 logger = logging.getLogger(__name__)
 
+@dataclass
+class ChatMessage:
+    role: str
+    content: str
 
 @dataclass
 class SessionState:
@@ -30,7 +34,7 @@ class SessionState:
     category: Optional[str] = None
     missing: list = field(default_factory=list)
     turns: int = 0
-
+    history: list[ChatMessage] = field(default_factory=list)
 
 # In-memory session store. key: session_id
 _SESSIONS: dict[str, SessionState] = {}
